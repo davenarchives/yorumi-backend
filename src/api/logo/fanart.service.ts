@@ -1,21 +1,34 @@
 import axios from 'axios';
 
-const FANART_API_KEY = process.env.FANART_API_KEY || '';
+const FANART_API_KEY = (
+    process.env.FANART_API_KEY ||
+    process.env.FANARTTV_API_KEY ||
+    process.env.FANART_TV_API_KEY ||
+    ''
+).trim();
 const FANART_BASE_URL = 'https://webservice.fanart.tv/v3/tv';
 
 // Log API key status at startup (don't log the actual key for security)
 console.log('[Fanart Service] API Key configured:', FANART_API_KEY ? '✓ Yes' : '✗ No');
 
-// Cache for TVDB ID mappings (AniList ID -> TVDB ID)
-const tvdbMappingCache = new Map<number, string | null>();
+type TimedCacheEntry<T> = {
+    value: T;
+    expiresAt: number;
+};
 
-// Cache for logo URLs (TVDB ID -> Logo URL)
-const logoCache = new Map<string, string | null>();
+const POSITIVE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+const NEGATIVE_CACHE_TTL = 30 * 60 * 1000; // 30 minutes
 
 // Cache for the entire anime list database (loaded once, reused)
 let animeDatabaseCache: any[] | null = null;
 let databaseLastFetched: number = 0;
 const DATABASE_CACHE_TTL = 24 * 60 * 60 * 1000; // 24 hours
+
+// Cache for TVDB ID mappings (AniList ID -> TVDB ID)
+const tvdbMappingCache = new Map<number, TimedCacheEntry<string | null>>();
+
+// Cache for logo URLs (TVDB ID -> Logo URL)
+const logoCache = new Map<string, TimedCacheEntry<string | null>>();
 
 interface FanartTVResponse {
     name: string;
@@ -43,16 +56,33 @@ interface AnifyMappingResponse {
     }[];
 }
 
+function getCachedValue<K, V>(cache: Map<K, TimedCacheEntry<V>>, key: K): V | undefined {
+    const entry = cache.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= Date.now()) {
+        cache.delete(key);
+        return undefined;
+    }
+    return entry.value;
+}
+
+function setCachedValue<K, V>(cache: Map<K, TimedCacheEntry<V>>, key: K, value: V, ttlMs: number): void {
+    cache.set(key, {
+        value,
+        expiresAt: Date.now() + ttlMs,
+    });
+}
+
 /**
  * Resolve AniList ID to TVDB ID using Fribb/anime-lists static database
  * More reliable than live APIs that frequently timeout
  */
 export async function getTVDBIdFromAniList(anilistId: number): Promise<string | null> {
     // Check cache first
-    if (tvdbMappingCache.has(anilistId)) {
-        const cached = tvdbMappingCache.get(anilistId);
+    const cached = getCachedValue(tvdbMappingCache, anilistId);
+    if (cached !== undefined) {
         console.log(`[Fanart] Cache hit for AniList ID ${anilistId} -> TVDB ${cached}`);
-        return cached ?? null;
+        return cached;
     }
 
     try {
@@ -75,7 +105,7 @@ export async function getTVDBIdFromAniList(anilistId: number): Promise<string | 
                 console.log(`[Fanart] Loaded anime database with ${animeDatabase.length} entries`);
             } else {
                 console.warn('[Fanart] Invalid database format received');
-                tvdbMappingCache.set(anilistId, null);
+                setCachedValue(tvdbMappingCache, anilistId, null, NEGATIVE_CACHE_TTL);
                 return null;
             }
         }
@@ -89,16 +119,16 @@ export async function getTVDBIdFromAniList(anilistId: number): Promise<string | 
         if (entry && entry.tvdb_id) {
             const tvdbId = String(entry.tvdb_id);
             console.log(`[Fanart] Resolved AniList ${anilistId} -> TVDB ${tvdbId}`);
-            tvdbMappingCache.set(anilistId, tvdbId);
+            setCachedValue(tvdbMappingCache, anilistId, tvdbId, POSITIVE_CACHE_TTL);
             return tvdbId;
         }
 
         console.log(`[Fanart] No TVDB mapping found for AniList ID ${anilistId}`);
-        tvdbMappingCache.set(anilistId, null);
+        setCachedValue(tvdbMappingCache, anilistId, null, NEGATIVE_CACHE_TTL);
         return null;
     } catch (error) {
         console.warn(`[Fanart] Error resolving TVDB ID for AniList ${anilistId}:`, error);
-        tvdbMappingCache.set(anilistId, null);
+        setCachedValue(tvdbMappingCache, anilistId, null, NEGATIVE_CACHE_TTL);
         return null;
     }
 }
@@ -108,15 +138,14 @@ export async function getTVDBIdFromAniList(anilistId: number): Promise<string | 
  */
 export async function getFanartLogo(tvdbId: string): Promise<string | null> {
     // Check cache first
-    if (logoCache.has(tvdbId)) {
-        const cached = logoCache.get(tvdbId);
+    const cached = getCachedValue(logoCache, tvdbId);
+    if (cached !== undefined) {
         console.log(`[Fanart] Logo cache hit for TVDB ${tvdbId}: ${cached}`);
-        return cached ?? null;
+        return cached;
     }
 
     if (!FANART_API_KEY) {
         console.warn('[Fanart] API key not configured');
-        logoCache.set(tvdbId, null);
         return null;
     }
 
@@ -140,21 +169,21 @@ export async function getFanartLogo(tvdbId: string): Promise<string | null> {
 
             if (selectedLogo) {
                 console.log(`[Fanart] Found logo for TVDB ${tvdbId}: ${selectedLogo.url}`);
-                logoCache.set(tvdbId, selectedLogo.url);
+                setCachedValue(logoCache, tvdbId, selectedLogo.url, POSITIVE_CACHE_TTL);
                 return selectedLogo.url;
             }
         }
 
         console.log(`[Fanart] No logo found for TVDB ${tvdbId}`);
-        logoCache.set(tvdbId, null);
+        setCachedValue(logoCache, tvdbId, null, NEGATIVE_CACHE_TTL);
         return null;
     } catch (error) {
         if (axios.isAxiosError(error) && error.response?.status === 404) {
             console.log(`[Fanart] No data found for TVDB ${tvdbId}`);
+            setCachedValue(logoCache, tvdbId, null, NEGATIVE_CACHE_TTL);
         } else {
             console.warn(`[Fanart] Error fetching logo for TVDB ${tvdbId}:`, error);
         }
-        logoCache.set(tvdbId, null);
         return null;
     }
 }
@@ -170,7 +199,7 @@ export async function getAnimeLogo(anilistId: number): Promise<{
 }> {
     // Check if we have cached logo mapping
     const cacheKey = anilistId;
-    const tvdbCached = tvdbMappingCache.has(cacheKey);
+    const tvdbCached = getCachedValue(tvdbMappingCache, cacheKey) !== undefined;
 
     // Step 1: Resolve to TVDB ID
     const tvdbId = await getTVDBIdFromAniList(anilistId);
@@ -179,7 +208,7 @@ export async function getAnimeLogo(anilistId: number): Promise<{
         return { logo: null, source: 'fallback', cached: tvdbCached };
     }
 
-    const logoCached = logoCache.has(tvdbId);
+    const logoCached = getCachedValue(logoCache, tvdbId) !== undefined;
 
     // Step 2: Fetch logo from Fanart.tv
     const logoUrl = await getFanartLogo(tvdbId);
