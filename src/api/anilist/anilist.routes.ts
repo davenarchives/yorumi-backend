@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { anilistService } from './anilist.service';
 import { HiAnimeScraper } from '../scraper/hianime.service';
 import { AnimePaheScraper } from '../../scraper/animepahe';
+import { AnimeKaiScraper } from '../../scraper/animekai';
 import { redis } from '../mapping/mapper';
 import { mappingService } from '../mapping/mapping.service';
 import { scraperService } from '../scraper/scraper.service';
@@ -95,6 +96,31 @@ const findRankedScraperCandidates = async (details: any) => {
     const titles = buildScraperQueries(details);
     const resultSets = await Promise.all(
         titles.map((title) => scraperService.search(title).catch(() => []))
+    );
+    const candidateMap = new Map<string, any>();
+
+    resultSets.forEach((found) => {
+        if (!Array.isArray(found)) return;
+        found.forEach((candidate) => {
+            if (candidate?.session && !candidateMap.has(String(candidate.session))) {
+                candidateMap.set(String(candidate.session), candidate);
+            }
+        });
+    });
+
+    return [...candidateMap.values()]
+        .map((candidate) => ({
+            candidate,
+            score: rankAgainstAnime(details, candidate),
+        }))
+        .filter((entry) => entry.score > 0)
+        .sort((a, b) => b.score - a.score);
+};
+const findRankedAnimeKaiCandidates = async (details: any) => {
+    const titles = buildScraperQueries(details);
+    const scraper = new AnimeKaiScraper();
+    const resultSets = await Promise.all(
+        titles.map((title) => scraper.search(title).catch(() => []))
     );
     const candidateMap = new Map<string, any>();
 
@@ -445,6 +471,7 @@ router.get('/anime/:id/fast', async (req, res) => {
         let animeDetails: any = null;
         let resolvedSession: string | null = null;
         let rankedCandidates: Array<{ candidate: any; score: number }> = [];
+        let resolvedCandidate: any = null;
 
         if (id.startsWith('s:')) {
             resolvedSession = id.substring(2).trim() || null;
@@ -508,6 +535,7 @@ router.get('/anime/:id/fast', async (req, res) => {
                 rankedCandidates = await findRankedScraperCandidates(animeDetails);
                 const best = rankedCandidates[0]?.candidate;
                 if (best?.session) {
+                    resolvedCandidate = best;
                     resolvedSession = String(best.session);
                     await mappingService.saveMapping(String(numericId), resolvedSession, String(best.title || animeDetails?.title?.english || animeDetails?.title?.romaji || '')).catch(() => undefined);
                 }
@@ -516,7 +544,7 @@ router.get('/anime/:id/fast', async (req, res) => {
 
         let episodes: any[] = [];
         if (resolvedSession) {
-            const ep = await scraperService.getEpisodes(resolvedSession).catch(() => ({ episodes: [] }));
+            const ep = await scraperService.getEpisodes(resolvedSession, resolvedCandidate?.id).catch(() => ({ episodes: [] }));
             episodes = Array.isArray(ep?.episodes) ? ep.episodes : [];
         }
 
@@ -526,10 +554,36 @@ router.get('/anime/:id/fast', async (req, res) => {
                 if (rankedCandidates.length === 0) {
                     rankedCandidates = await findRankedScraperCandidates(animeDetails);
                 }
+
+                if (resolvedSession && !resolvedCandidate?.id) {
+                    const sameSessionCandidate = rankedCandidates.find(
+                        ({ candidate }) => String(candidate?.session || '') === String(resolvedSession || '')
+                    )?.candidate;
+                    if (sameSessionCandidate?.id) {
+                        resolvedCandidate = sameSessionCandidate;
+                        const retryCurrent = await scraperService.getEpisodes(resolvedSession, sameSessionCandidate.id).catch(() => ({ episodes: [] }));
+                        episodes = Array.isArray(retryCurrent?.episodes) ? retryCurrent.episodes : [];
+                    }
+                }
+
+                if (episodes.length > 0) {
+                    const result = {
+                        anime: animeDetails,
+                        scraperSession: resolvedSession,
+                        episodes,
+                    };
+
+                    redis.set(composedCacheKey, result, { ex: 180 }).catch(() => undefined);
+                    res.set('Cache-Control', 'public, max-age=60, s-maxage=120, stale-while-revalidate=300');
+                    res.json(result);
+                    return;
+                }
+
                 const fallbackCandidate = rankedCandidates.find(
                     ({ candidate }) => String(candidate?.session || '') !== String(resolvedSession || '')
                 )?.candidate;
                 if (fallbackCandidate?.session) {
+                    resolvedCandidate = fallbackCandidate;
                     resolvedSession = String(fallbackCandidate.session);
                     await mappingService.saveMapping(
                         String(numericId),
@@ -537,8 +591,25 @@ router.get('/anime/:id/fast', async (req, res) => {
                         String(fallbackCandidate.title || animeDetails?.title?.english || animeDetails?.title?.romaji || '')
                     ).catch(() => undefined);
 
-                    const retry = await scraperService.getEpisodes(resolvedSession).catch(() => ({ episodes: [] }));
+                    const retry = await scraperService.getEpisodes(resolvedSession, fallbackCandidate.id).catch(() => ({ episodes: [] }));
                     episodes = Array.isArray(retry?.episodes) ? retry.episodes : [];
+                }
+
+                if (episodes.length === 0) {
+                    const animeKaiCandidates = await findRankedAnimeKaiCandidates(animeDetails);
+                    const animeKaiBest = animeKaiCandidates[0]?.candidate;
+                    if (animeKaiBest?.session) {
+                        resolvedSession = `ak:${String(animeKaiBest.session).trim()}`;
+                        resolvedCandidate = animeKaiBest;
+                        await mappingService.saveMapping(
+                            String(numericId),
+                            resolvedSession,
+                            String(animeKaiBest.title || animeDetails?.title?.english || animeDetails?.title?.romaji || '')
+                        ).catch(() => undefined);
+
+                        const animeKaiEpisodes = await scraperService.getEpisodes(resolvedSession).catch(() => ({ episodes: [] }));
+                        episodes = Array.isArray(animeKaiEpisodes?.episodes) ? animeKaiEpisodes.episodes : [];
+                    }
                 }
             }
         }

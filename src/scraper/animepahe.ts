@@ -216,6 +216,116 @@ export class AnimePaheScraper {
         };
     }
 
+    private parseAnimeNumericIdFromHtml(html: string): string | null {
+        const sourceHtml = String(html || '');
+        if (!sourceHtml) return null;
+
+        const $ = cheerio.load(sourceHtml);
+        const metaId = $('meta[name="id"]').attr('content')?.trim();
+        if (metaId && /^\d+$/.test(metaId)) {
+            return metaId;
+        }
+
+        const scriptMatch = sourceHtml.match(/\blet\s+id\s*=\s*["']([^"']+)["']/i);
+        if (scriptMatch?.[1] && /^\d+$/.test(scriptMatch[1])) {
+            return scriptMatch[1];
+        }
+
+        return null;
+    }
+
+    private normalizeTitle(value: string): string {
+        return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
+    }
+
+    private async resolveAnimePaheId(session: string): Promise<string | null> {
+        const animeUrl = `${BASE_URL}/anime/${session}`;
+        let fallbackTitle = '';
+
+        try {
+            const response = await axios.get(animeUrl, {
+                headers: {
+                    ...this.requestHeaders,
+                    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                },
+                timeout: 15000,
+                responseType: 'text',
+            });
+
+            const resolved = this.parseAnimeNumericIdFromHtml(String(response.data || ''));
+            if (resolved) return resolved;
+        } catch {
+            // Fall through to browser-backed resolution.
+        }
+
+        const browser = await this.getBrowser();
+        const page = await browser.newPage();
+        await page.setUserAgent(this.requestHeaders['User-Agent']);
+
+        try {
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const resourceType = req.resourceType();
+                if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+                    req.abort();
+                } else {
+                    req.continue();
+                }
+            });
+
+            await page.goto(animeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            try {
+                await page.waitForFunction(
+                    () => !/checking your browser/i.test(document.title) && !/ddos-guard/i.test(document.body.innerText),
+                    { timeout: 12000 }
+                );
+            } catch {
+                await new Promise((resolve) => setTimeout(resolve, 8000));
+            }
+
+            const resolvedFromDom = await page.evaluate(() => {
+                const meta = document.querySelector('meta[name="id"]')?.getAttribute('content')?.trim();
+                if (meta && /^\d+$/.test(meta)) return meta;
+                const win = window as Window & { id?: string };
+                const scriptId = typeof win.id === 'string' ? win.id.trim() : '';
+                return /^\d+$/.test(scriptId) ? scriptId : null;
+            });
+            if (resolvedFromDom) return resolvedFromDom;
+
+            fallbackTitle = await page.title().catch(() => '');
+            fallbackTitle = fallbackTitle
+                .replace(/\s*Ep\..*$/i, '')
+                .replace(/\s*::\s*animepahe\s*$/i, '')
+                .trim();
+
+            const html = await page.content();
+            const resolvedFromHtml = this.parseAnimeNumericIdFromHtml(html);
+            if (resolvedFromHtml) return resolvedFromHtml;
+        } catch {
+            // Fall through to search-backed resolution.
+        } finally {
+            await page.close();
+        }
+
+        const info = await this.getAnimeInfo(session).catch(() => null);
+        const title = String(fallbackTitle || info?.title || '').trim();
+        if (!title) return null;
+
+        try {
+            const candidates = await this.search(title);
+            const bySession = candidates.find((item) => String(item.session || '').trim() === session);
+            if (bySession?.id) return String(bySession.id);
+
+            const normalizedTitle = this.normalizeTitle(title);
+            const byTitle = candidates.find((item) => this.normalizeTitle(String(item.title || '')) === normalizedTitle);
+            if (byTitle?.id) return String(byTitle.id);
+        } catch {
+            // Ignore search fallback failures.
+        }
+
+        return null;
+    }
+
     async getAnimeInfo(session: string): Promise<AnimeInfo | null> {
         const animeUrl = `${BASE_URL}/anime/${session}`;
 
@@ -274,9 +384,15 @@ export class AnimePaheScraper {
         }
     }
 
-    async getEpisodes(animeSessionId: string, pageNum: number = 1): Promise<{ episodes: Episode[], lastPage: number }> {
+    async getEpisodes(animeSessionId: string, pageNum: number = 1, animePaheIdHint?: string | number): Promise<{ episodes: Episode[], lastPage: number }> {
+        const animePaheId = String(animePaheIdHint || '').trim() || await this.resolveAnimePaheId(animeSessionId);
+        if (!animePaheId) {
+            console.warn(`Could not resolve AnimePahe numeric ID for session ${animeSessionId}`);
+            return { episodes: [], lastPage: 1 };
+        }
+
         const buildEpisodesApiUrl = (page: number) =>
-            `${API_URL}?m=release&id=${animeSessionId}&sort=episode_asc&page=${page}`;
+            `${API_URL}?m=release&id=${animePaheId}&sort=episode_asc&page=${page}`;
         const mapApiEpisodes = (items: any[]): Episode[] => items.map((item: any) => ({
             id: item.id.toString(),
             session: item.session,
@@ -342,6 +458,52 @@ export class AnimePaheScraper {
         const browser = await this.getBrowser();
         const page = await browser.newPage();
         await page.setUserAgent(this.requestHeaders['User-Agent']);
+        const fetchEpisodesViaBrowserNavigation = async () => {
+            const openApiPage = async (pageIndex: number) => {
+                const apiUrl = buildEpisodesApiUrl(pageIndex);
+                await page.goto(apiUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+                try {
+                    await page.waitForFunction(
+                        () => document.body.innerText.trim().startsWith('{'),
+                        { timeout: 12000 }
+                    );
+                } catch {
+                    await new Promise((resolve) => setTimeout(resolve, 4000));
+                }
+
+                const responseText = await page.evaluate(() => document.body.innerText);
+                const parsed = JSON.parse(responseText);
+                return parsed;
+            };
+
+            const first = await openApiPage(pageNum);
+            if (!Array.isArray(first?.data)) return null;
+
+            const lastPage = Number(first?.last_page || 1);
+            const pages = [first];
+
+            for (let currentPage = pageNum + 1; currentPage <= lastPage; currentPage += 1) {
+                const next = await openApiPage(currentPage);
+                if (!Array.isArray(next?.data)) {
+                    return {
+                        episodes: dedupeAndSortEpisodes(
+                            pages.flatMap((payload: any) => Array.isArray(payload?.data) ? mapApiEpisodes(payload.data) : [])
+                        ),
+                        lastPage,
+                        complete: false,
+                    };
+                }
+                pages.push(next);
+            }
+
+            return {
+                episodes: dedupeAndSortEpisodes(
+                    pages.flatMap((payload: any) => Array.isArray(payload?.data) ? mapApiEpisodes(payload.data) : [])
+                ),
+                lastPage,
+                complete: true,
+            };
+        };
 
         try {
             console.log(`Fetching episodes via browser context: ${animeSessionId}`);
@@ -368,97 +530,16 @@ export class AnimePaheScraper {
                 await new Promise((resolve) => setTimeout(resolve, 8000));
             }
 
-            const browserApiResponse = await page.evaluate(async (sessionId) => {
-                const firstResponse = await fetch(`/api?m=release&id=${encodeURIComponent(sessionId)}&sort=episode_asc&page=1`, {
-                    credentials: 'include',
-                    headers: {
-                        'Accept': 'application/json, text/plain, */*'
-                    }
-                });
-                const firstText = await firstResponse.text();
-                let firstParsed = null;
-                try {
-                    firstParsed = JSON.parse(firstText);
-                } catch {
+            const browserApiResponse = await fetchEpisodesViaBrowserNavigation().catch(() => null);
+
+            if (browserApiResponse?.episodes?.length) {
+                if (browserApiResponse.complete && isCompletePayload(browserApiResponse.episodes, browserApiResponse.lastPage)) {
                     return {
-                        ok: false,
-                        first: {
-                            ok: false,
-                            status: firstResponse.status,
-                            text: firstText
-                        }
+                        episodes: browserApiResponse.episodes,
+                        lastPage: browserApiResponse.lastPage
                     };
                 }
-
-                const first = {
-                    ok: firstResponse.ok,
-                    status: firstResponse.status,
-                    parsed: firstParsed
-                };
-                if (!first.ok || !first.parsed?.data) {
-                    return { ok: false, first };
-                }
-
-                const lastPage = Number(first.parsed.last_page || 1);
-                const pages = [first.parsed];
-
-                for (let currentPage = 2; currentPage <= lastPage; currentPage += 1) {
-                    const nextResponse = await fetch(`/api?m=release&id=${encodeURIComponent(sessionId)}&sort=episode_asc&page=${currentPage}`, {
-                        credentials: 'include',
-                        headers: {
-                            'Accept': 'application/json, text/plain, */*'
-                        }
-                    });
-                    const nextText = await nextResponse.text();
-                    let nextParsed = null;
-                    try {
-                        nextParsed = JSON.parse(nextText);
-                    } catch {
-                        return {
-                            ok: false,
-                            first,
-                            failedPage: currentPage,
-                            failed: {
-                                ok: false,
-                                status: nextResponse.status,
-                                text: nextText
-                            }
-                        };
-                    }
-
-                    if (!nextResponse.ok || !nextParsed?.data) {
-                        return {
-                            ok: false,
-                            first,
-                            failedPage: currentPage,
-                            failed: {
-                                ok: nextResponse.ok,
-                                status: nextResponse.status,
-                                parsed: nextParsed
-                            }
-                        };
-                    }
-                    pages.push(nextParsed);
-                }
-
-                return { ok: true, pages, lastPage };
-            }, animeSessionId);
-
-            if (browserApiResponse?.ok && Array.isArray(browserApiResponse.pages)) {
-                const episodes = dedupeAndSortEpisodes(
-                    browserApiResponse.pages.flatMap((payload: any) =>
-                        Array.isArray(payload?.data) ? mapApiEpisodes(payload.data) : []
-                    )
-                );
-
-                const lastPage = Number(browserApiResponse.lastPage || 1);
-                if (isCompletePayload(episodes, lastPage)) {
-                    return {
-                        episodes,
-                        lastPage
-                    };
-                }
-                console.warn(`AnimePahe browser episode fetch incomplete for ${animeSessionId}: ${episodes.length}/${lastPage} pages`);
+                console.warn(`AnimePahe browser episode fetch incomplete for ${animeSessionId}: ${browserApiResponse.episodes.length}/${browserApiResponse.lastPage} pages`);
             }
 
             console.warn('Browser API episode fetch failed, falling back to HTML page scrape');
