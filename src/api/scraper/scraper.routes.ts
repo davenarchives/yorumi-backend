@@ -4,6 +4,21 @@ import axios from 'axios';
 
 const router = Router();
 const upstreamCookieJar = new Map<string, string>();
+const SEARCH_TIMEOUT_MS = 8000;
+
+const withTimeout = async <T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> => {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((resolve) => {
+                timeoutHandle = setTimeout(() => resolve(fallback), ms);
+            }),
+        ]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
+};
 
 const mergeCookieHeader = (existing: string, setCookie: string[]) => {
     const jar = new Map<string, string>();
@@ -73,7 +88,10 @@ router.get('/search', async (req, res) => {
         if (!query) {
             return res.status(400).json({ error: 'Query parameter q is required' });
         }
-        const result = await scraperService.search(query);
+        const result = await withTimeout(scraperService.search(query), SEARCH_TIMEOUT_MS, []);
+        if (!Array.isArray(result)) {
+            return res.json([]);
+        }
         res.set('Cache-Control', 'public, max-age=60, s-maxage=120, stale-while-revalidate=300');
         res.json(result);
     } catch (error: any) {

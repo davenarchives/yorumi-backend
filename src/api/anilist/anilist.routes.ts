@@ -9,6 +9,8 @@ import { scraperService } from '../scraper/scraper.service';
 const router = Router();
 const HOME_FAST_CACHE_KEY = 'anilist:home:fast:v1';
 const HOME_FAST_TTL_SECONDS = 120;
+const SCRAPER_SEARCH_TIMEOUT_MS = 7000;
+const SCRAPER_EPISODES_TIMEOUT_MS = 8000;
 let homeFastMemoryCache: { data: any; timestamp: number } | null = null;
 let homeFastRefreshPromise: Promise<any> | null = null;
 const isAnimePaheSession = (value: unknown) =>
@@ -126,6 +128,20 @@ const findRankedScraperCandidates = async (details: any) => {
         }))
         .filter((entry) => entry.score > 0)
         .sort((a, b) => b.score - a.score);
+};
+
+const withTimeout = async <T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> => {
+    let timeoutHandle: NodeJS.Timeout | null = null;
+    try {
+        return await Promise.race([
+            promise,
+            new Promise<T>((resolve) => {
+                timeoutHandle = setTimeout(() => resolve(fallback), ms);
+            }),
+        ]);
+    } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+    }
 };
 
 const getFreshHomeFastFromMemory = () => {
@@ -520,7 +536,11 @@ router.get('/anime/:id/fast', async (req, res) => {
             }
 
             if (!resolvedSession) {
-                rankedCandidates = await findRankedScraperCandidates(animeDetails);
+                rankedCandidates = await withTimeout(
+                    findRankedScraperCandidates(animeDetails),
+                    SCRAPER_SEARCH_TIMEOUT_MS,
+                    []
+                );
                 const best = rankedCandidates[0]?.candidate;
                 if (best?.session) {
                     resolvedCandidate = best;
@@ -531,7 +551,11 @@ router.get('/anime/:id/fast', async (req, res) => {
 
         let episodes: any[] = [];
         if (resolvedSession) {
-            const ep = await scraperService.getEpisodes(resolvedSession, resolvedCandidate?.id).catch(() => ({ episodes: [] }));
+            const ep = await withTimeout(
+                scraperService.getEpisodes(resolvedSession, resolvedCandidate?.id).catch(() => ({ episodes: [] })),
+                SCRAPER_EPISODES_TIMEOUT_MS,
+                { episodes: [], lastPage: 1 }
+            );
             episodes = Array.isArray(ep?.episodes) ? ep.episodes : [];
         }
 
@@ -543,7 +567,11 @@ router.get('/anime/:id/fast', async (req, res) => {
                 }
 
                 if (rankedCandidates.length === 0) {
-                    rankedCandidates = await findRankedScraperCandidates(animeDetails);
+                    rankedCandidates = await withTimeout(
+                        findRankedScraperCandidates(animeDetails),
+                        SCRAPER_SEARCH_TIMEOUT_MS,
+                        []
+                    );
                 }
 
                 if (resolvedSession && !resolvedCandidate?.id) {
@@ -552,7 +580,11 @@ router.get('/anime/:id/fast', async (req, res) => {
                     )?.candidate;
                     if (sameSessionCandidate?.id) {
                         resolvedCandidate = sameSessionCandidate;
-                        const retryCurrent = await scraperService.getEpisodes(resolvedSession, sameSessionCandidate.id).catch(() => ({ episodes: [] }));
+                        const retryCurrent = await withTimeout(
+                            scraperService.getEpisodes(resolvedSession, sameSessionCandidate.id).catch(() => ({ episodes: [] })),
+                            SCRAPER_EPISODES_TIMEOUT_MS,
+                            { episodes: [], lastPage: 1 }
+                        );
                         episodes = Array.isArray(retryCurrent?.episodes) ? retryCurrent.episodes : [];
                     }
                 }
@@ -576,7 +608,11 @@ router.get('/anime/:id/fast', async (req, res) => {
                 if (fallbackCandidate?.session) {
                     resolvedCandidate = fallbackCandidate;
                     resolvedSession = String(fallbackCandidate.session);
-                    const retry = await scraperService.getEpisodes(resolvedSession, fallbackCandidate.id).catch(() => ({ episodes: [] }));
+                    const retry = await withTimeout(
+                        scraperService.getEpisodes(resolvedSession, fallbackCandidate.id).catch(() => ({ episodes: [] })),
+                        SCRAPER_EPISODES_TIMEOUT_MS,
+                        { episodes: [], lastPage: 1 }
+                    );
                     episodes = Array.isArray(retry?.episodes) ? retry.episodes : [];
                 }
 
