@@ -1,25 +1,14 @@
 import { AnimePaheScraper } from '../../scraper/animepahe';
-import { AnimeKaiScraper } from '../../scraper/animekai';
 import { cacheGet, cacheSet } from '../../utils/redis-cache';
 
 export class ScraperService {
     private fastScraper: AnimePaheScraper;
-    private animeKaiScraper: AnimeKaiScraper;
     private cache = new Map<string, { expiresAt: number; value: any }>();
     private inFlight = new Map<string, Promise<any>>();
     private hotStreamKeys = new Map<string, { animeSession: string; epSession: string; hits: number; lastAccess: number }>();
 
     constructor() {
         this.fastScraper = new AnimePaheScraper();
-        this.animeKaiScraper = new AnimeKaiScraper();
-    }
-
-    private parseProviderSession(session: string) {
-        const raw = String(session || '').trim();
-        if (raw.startsWith('ak:')) {
-            return { provider: 'animekai' as const, session: raw.substring(3) };
-        }
-        return { provider: 'animepahe' as const, session: raw };
     }
 
     private async getOrLoad<T>(
@@ -120,7 +109,6 @@ export class ScraperService {
     }
 
     async getEpisodes(session: string, animePaheIdHint?: string | number) {
-        const parsed = this.parseProviderSession(session);
         const isCompleteEpisodePayload = (value: any) => {
             const episodes = Array.isArray(value?.episodes) ? value.episodes : [];
             const lastPage = Number(value?.lastPage || 1);
@@ -132,9 +120,7 @@ export class ScraperService {
             `episodes:v7:${session}`,
             15 * 60 * 1000,
             async () => {
-                const fast = parsed.provider === 'animekai'
-                    ? await this.animeKaiScraper.getEpisodes(parsed.session)
-                    : await this.fastScraper.getEpisodes(parsed.session, 1, animePaheIdHint);
+                const fast = await this.fastScraper.getEpisodes(session, 1, animePaheIdHint);
                 if (Array.isArray(fast.episodes) && fast.episodes.length > 0) {
                     return fast;
                 }
@@ -150,15 +136,11 @@ export class ScraperService {
     async getStreams(animeSession: string, epSession: string) {
         this.trackHotStream(animeSession, epSession);
         const key = `streams:v6:${animeSession}:${epSession}`;
-        const parsedAnime = this.parseProviderSession(animeSession);
-        const parsedEpisode = this.parseProviderSession(epSession);
         return this.getOrLoad(
             key,
             5 * 60 * 1000,
             async () => {
-                const links = parsedAnime.provider === 'animekai' || parsedEpisode.provider === 'animekai'
-                    ? await this.animeKaiScraper.getLinks(parsedAnime.session, parsedEpisode.session)
-                    : await this.fastScraper.getLinks(parsedAnime.session, parsedEpisode.session);
+                const links = await this.fastScraper.getLinks(animeSession, epSession);
                 return Array.isArray(links) ? links : [];
             },
             {
