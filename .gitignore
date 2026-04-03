@@ -1,0 +1,58 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Node modules
+node_modules/
+
+# Build artifacts
+dist/
+build/
+*.exe
+
+# Cache and temporary files
+.cache/
+.parcel-cache/
+.next/
+.nuxt/
+.vercel
+.turbo
+.cursor
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Misc logs/assets
+avatars/*
+!avatars/.gitkeep
+build_error.log
+check_selectors.js
+debug_after_wait.png
+find_mk_alphabet.js
+find_mk_links.js
+hianime_home.html
+probe_mk_urls.js
+manga_response.json
+scraper_results.json
+search_output.json
+ts_error.log
+tsc_audit.log
+tsc_error.log
+lint.txt
+lint2.json
+lint2.txt
+lint_output.txt
+lint_service.txt
