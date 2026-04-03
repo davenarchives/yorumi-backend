@@ -92,10 +92,22 @@ const rankAgainstAnime = (details: any, candidate: any) => {
     return score;
 };
 const findRankedScraperCandidates = async (details: any) => {
-    const titles = buildScraperQueries(details);
-    const resultSets = await Promise.all(
-        titles.map((title) => scraperService.search(title).catch(() => []))
-    );
+    const titles = buildScraperQueries(details).slice(0, 4);
+    const resultSets: any[][] = [];
+
+    for (const title of titles) {
+        const found = await scraperService.search(title).catch(() => []);
+        resultSets.push(Array.isArray(found) ? found : []);
+
+        // Stop early once we already have a strong exact-ish title match.
+        const hasHighConfidenceMatch = resultSets
+            .flat()
+            .some((candidate) => rankAgainstAnime(details, candidate) >= 120);
+        if (hasHighConfidenceMatch) {
+            break;
+        }
+    }
+
     const candidateMap = new Map<string, any>();
 
     resultSets.forEach((found) => {

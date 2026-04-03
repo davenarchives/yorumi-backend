@@ -108,59 +108,70 @@ export class AnimePaheScraper {
         }
 
         // Fallback: Puppeteer path for protected responses
-        const browser = await this.getBrowser();
-        const page = await browser.newPage();
-        await page.setUserAgent(this.requestHeaders['User-Agent']);
-
         try {
-            console.log(`Searching: ${searchUrl}`);
-
-            // Go directly to search URL
-            await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
-
-            // Wait for potential DDoS guard to resolve
-            // We check if the body looks like JSON (starts with {)
+            const browser = await this.getBrowser();
+            const page = await browser.newPage();
             try {
-                await page.waitForFunction(
-                    () => document.body.innerText.trim().startsWith('{'),
-                    { timeout: 8000 } // Give it 8s max to resolve
-                );
-            } catch (e) {
-                console.log('Timeout waiting for JSON expectation, trying to parse anyway...');
-            }
+                await page.setUserAgent(this.requestHeaders['User-Agent']);
+                await page.setRequestInterception(true);
+                page.on('request', (req) => {
+                    const resourceType = req.resourceType();
+                    if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+                        req.abort();
+                    } else {
+                        req.continue();
+                    }
+                });
 
-            const responseText = await page.evaluate(() => document.body.innerText);
+                console.log(`Searching: ${searchUrl}`);
 
-            let response: any;
-            try {
-                response = JSON.parse(responseText);
-            } catch (e) {
-                console.error("Failed to parse search JSON:", responseText);
+                // Go directly to search URL
+                await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 15000 });
+
+                // Wait for potential DDoS guard to resolve
+                // We check if the body looks like JSON (starts with {)
+                try {
+                    await page.waitForFunction(
+                        () => document.body.innerText.trim().startsWith('{'),
+                        { timeout: 8000 } // Give it 8s max to resolve
+                    );
+                } catch (e) {
+                    console.log('Timeout waiting for JSON expectation, trying to parse anyway...');
+                }
+
+                const responseText = await page.evaluate(() => document.body.innerText);
+
+                let response: any;
+                try {
+                    response = JSON.parse(responseText);
+                } catch (e) {
+                    console.error("Failed to parse search JSON:", responseText);
+                    return [];
+                }
+
+                console.log("Search Response:", JSON.stringify(response));
+
+                if (response && response.data) {
+                    return response.data.map((item: any) => ({
+                        id: item.id,
+                        session: item.session,
+                        title: item.title,
+                        url: `/anime/${item.session}`,
+                        poster: item.poster,
+                        status: item.status,
+                        type: item.type,
+                        episodes: item.episodes,
+                        year: item.year,
+                        score: item.score
+                    }));
+                }
                 return [];
+            } finally {
+                await page.close();
             }
-
-            console.log("Search Response:", JSON.stringify(response));
-
-            if (response && response.data) {
-                return response.data.map((item: any) => ({
-                    id: item.id,
-                    session: item.session,
-                    title: item.title,
-                    url: `/anime/${item.session}`,
-                    poster: item.poster,
-                    status: item.status,
-                    type: item.type,
-                    episodes: item.episodes,
-                    year: item.year,
-                    score: item.score
-                }));
-            }
-            return [];
         } catch (error) {
             console.error('Error during search:', error);
             return [];
-        } finally {
-            await page.close();
         }
     }
 
