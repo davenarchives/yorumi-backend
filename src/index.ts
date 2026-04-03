@@ -12,34 +12,38 @@ if (shouldRunStandaloneServer) {
     const startServer = async () => {
         console.log('Starting Yorumi Backend Server...');
 
-        const hianimeScraper = new HiAnimeScraper();
-
-        try {
-            console.log('Warming anime spotlight cache...');
-            await Promise.race([
-                hianimeScraper.getEnrichedSpotlight(),
-                new Promise((_, reject) =>
-                    setTimeout(() => reject(new Error('Cache warming timeout')), 10000)
-                )
-            ]);
-            console.log('Spotlight cache warmed successfully');
-        } catch (error) {
-            console.warn('Spotlight cache warming failed or timed out:', error);
-            console.warn('Server will continue, cache will be populated on first request');
-        }
-
-        try {
-            await warmSpotlightCache();
-            await warmupAnimeDatabase();
-        } catch (error) {
-            console.warn('Other cache warming failed:', error);
-        }
-
+        // Start listening immediately so Render/Vercel health checks pass
         app.listen(port, () => {
-            console.log(`Server is running on http://localhost:${port}`);
+            console.log(`Server is running on port ${port}`);
         });
 
-        startScraperWarmer();
+        const hianimeScraper = new HiAnimeScraper();
+
+        // Perform warming in the background
+        (async () => {
+            try {
+                console.log('Warming anime spotlight cache...');
+                await Promise.race([
+                    hianimeScraper.getEnrichedSpotlight(),
+                    new Promise((_, reject) =>
+                        setTimeout(() => reject(new Error('Cache warming timeout')), 15000)
+                    )
+                ]);
+                console.log('Spotlight cache warmed successfully');
+            } catch (error) {
+                console.warn('Spotlight cache warming failed or timed out:', error);
+            }
+
+            try {
+                await warmSpotlightCache();
+                await warmupAnimeDatabase();
+                console.log('All caches warmed successfully');
+            } catch (error) {
+                console.warn('Other cache warming failed:', error);
+            }
+
+            startScraperWarmer();
+        })();
 
         setInterval(() => {
             console.log('Running scheduled spotlight refresh...');
